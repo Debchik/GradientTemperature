@@ -9,14 +9,14 @@ class ParamSlider:
         self.name_par = name_par
         self.dec_round = lambda x: int(round(x, 0)) if dec_number == 0 else round(x, dec_number)
         self.init_values = {
-            'slider': [250, 15],
+            'slider': [180, 12],
             'sl_value': {
-                'offset': [200, 9],
-                'size': (30, 25)
+                'offset': [35, -24],
+                'size': (70, 20)
             },
             'par_name': {
-                'offset': [430, 14],
-                'size': (50, 30)
+                'offset': [110, 34],
+                'size': (220, 22)
             }
         }
 

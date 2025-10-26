@@ -26,7 +26,7 @@ class Demo:
         position : tuple
             (x, y) coordinates of the top‑left corner of the simulation box.
         demo_size : tuple
-            (width, height) of the square simulation area in pixels.
+            (width, height) of the simulation area in pixels.
         bg_color : tuple
             RGB background colour of the simulation area.
         border_color : tuple
@@ -43,10 +43,10 @@ class Demo:
         self.position = position
         # Pygame rect describing the simulation area
         self.main = pygame.Rect(*position, *demo_size)
-        # Size of the square simulation area (in pixels)
-        self.size = demo_size[0]
+        # Store individual dimensions so the demo can be rectangular
+        self.width, self.height = demo_size
         # Pixel coordinates of the bottom‑left corner of the simulation area (used for transforms)
-        self.pos_start = position[0], position[1] + self.size
+        self.pos_start = position[0], position[1] + self.height
         # Copy of the initial parameter values used by sliders
         # Copy of the initial parameter values used by sliders.  Remove keys
         # corresponding to unused simulation parameters (gamma, k, mass of spring,
@@ -79,8 +79,9 @@ class Demo:
         self.tagged_indices: list[int] = []
         # Colour used for tagged particles.  Tagged particles will be
         # drawn in a distinct colour.  According to the latest
-        # requirements the marked particles should appear in black.
-        self.tagged_color: tuple[int, int, int] = (0, 0, 0)
+        # requirements the marked particles should appear bright yellow
+        # to stand out against the temperature gradient colours.
+        self.tagged_color: tuple[int, int, int] = (255, 165, 0)
 
         # Masses for gas particles only.  ``self.params['r']`` specifies the
         # number of gas particles; there are no spring masses in this
@@ -199,10 +200,11 @@ class Demo:
         # Convert physical radius (0–1) to pixel radius.  Multiply by
         # ``draw_radius_factor`` to make particles visually smaller than
         # their physical size to reduce apparent overlap in the UI.
-        r_radius = self.size * self.simulation.R * self.draw_radius_factor
+        scale = min(self.width, self.height)
+        r_radius = scale * self.simulation.R * self.draw_radius_factor
         # Transform positions from unit box to screen coordinates
-        r[0] = self.pos_start[0] + r[0] * self.size
-        r[1] = self.pos_start[1] - r[1] * self.size
+        r[0] = self.pos_start[0] + r[0] * self.width
+        r[1] = self.pos_start[1] - r[1] * self.height
         r = np.round(r)
         r_radius = max(1, int(round(r_radius)))
         # Compute velocities and speed magnitudes for color mapping
@@ -240,7 +242,12 @@ class Demo:
         pygame.draw.rect(
             self.screen,
             self.bg_screen_color,
-            (self.position[0] - mask_border, self.position[1] - mask_border, self.size + mask_border * 2, self.size + mask_border * 2),
+            (
+                self.position[0] - mask_border,
+                self.position[1] - mask_border,
+                self.width + mask_border * 2,
+                self.height + mask_border * 2,
+            ),
             mask_border,
         )
         pygame.draw.rect(
@@ -249,8 +256,8 @@ class Demo:
             (
                 self.position[0] - inner_border,
                 self.position[1] - inner_border,
-                self.size + inner_border * 2,
-                self.size + inner_border * 2,
+                self.width + inner_border * 2,
+                self.height + inner_border * 2,
             ),
             inner_border,
         )

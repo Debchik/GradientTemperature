@@ -34,10 +34,16 @@ from scipy import stats
 # Thermal wall utility functions
 ################################################################################
 
-# Boltzmann constant in SI units.  The rest of the simulation uses
-# reduced units where the box has side length 1.  The mass of a
-# particle and the characteristic temperature determine velocity scales.
-kB: float = 1.380e-2
+# Boltzmann constant (scaled to simulation units).  Together with the
+# particle mass this sets the characteristic thermal speed.  The value
+# here is tuned so that wall temperatures of a few hundred kelvin
+# produce noticeable motion for particles whose masses are taken from
+# ``config.json``.
+kB: float = 3.0e-6
+
+# Base integration step in simulation time units.  Larger values speed up
+# motion on screen but may slightly increase numerical error.
+TIME_STEP: float = 6.0e-4
 
 # Create a default random number generator.  If NumPy is unavailable
 # ``rng`` will remain ``None`` and fallbacks will be used instead.
@@ -260,7 +266,7 @@ class Simulation:
             with ``kB``.
         """
         # Store constants and parameters
-        self._k_boltz: float = 1.380 * 1e-2  # scaled Boltzmann constant used in original project
+        self._k_boltz: float = kB
         self._gamma: float = gamma
         self._k: float = k
         self._l_0: float = l_0
@@ -302,6 +308,8 @@ class Simulation:
 
         # Frame counter for energy fixes (unused, kept for API compatibility)
         self._frame_no: int = 1
+        # Base integration time step (can be tweaked later if needed)
+        self._dt: float = TIME_STEP
 
     # -------------------------------------------------------------------------
     # Properties to expose slices of the state
@@ -505,7 +513,7 @@ class Simulation:
         The tuple contains positions and velocities of gas particles and
         (empty) spring particles, plus the value returned by ``motion``.
         """
-        f = self.motion(dt=0.00001)
+        f = self.motion(dt=self._dt)
         self._frame_no = (self._frame_no + 1) % 5
 
         self._potential_energy.append(self.calc_potential_energy())
@@ -649,18 +657,30 @@ class Simulation:
         return np.sum((np.linalg.norm(self._v, axis=0) ** 2) * self._m) / 2.0
 
     def _fix_energy(self) -> None:
-        """Rescale velocities to maintain the target energy.
+        """Gently counteract numerical drift without blocking heat exchange.
 
-        In this version without springs, the total energy is simply kinetic.
-        We rescale velocities occasionally to keep energy from drifting due
-        to numerical errors.  This method is called automatically every
-        few frames in ``__next__``.
+        The total energy should change only due to wall interactions or
+        deliberate parameter updates.  We therefore track a slowly varying
+        target energy and only rescale velocities when the instantaneous
+        energy deviates slightly from that target (typical of integration
+        error).  Substantial changes driven by the walls are preserved.
         """
         current_E = self.calc_full_energy()
-        if current_E == 0:
+        if current_E <= 0.0:
             return
-        scale = math.sqrt(self._E_full / current_E)
-        self._v *= scale
+
+        if self._E_full <= 0.0:
+            self._E_full = current_E
+            return
+
+        relax = 0.1
+        self._E_full = (1.0 - relax) * self._E_full + relax * current_E
+        scale = self._E_full / current_E
+        if scale <= 0.0:
+            return
+        scale = math.sqrt(scale)
+        if abs(scale - 1.0) < 0.05:
+            self._v *= scale
 
     def calc_full_energy(self) -> float:
         """Return the total energy (purely kinetic)."""

@@ -8,6 +8,9 @@ with sliders and control buttons.  Methods related to charts are
 retained but reduced to no‑ops to preserve API compatibility.
 """
 
+import math
+from collections import OrderedDict
+
 import pygame
 import language
 from button import Button
@@ -28,26 +31,17 @@ class DemoScreen:
         self.middle_font = pygame.font.SysFont(self.font, 40, bold=True)
         self.big_font = pygame.font.SysFont(self.font, 50)
 
-        # Buttons: Add Particles, Apply changes, Menu.  Mode button has been
-        # removed as there is no alternate display mode.  Button labels
-        # are provided directly in Russian rather than relying on the
-        # language dictionary.
-        base_btn_x = app.monitor.width * 0.05 + 30
-        btn_y = app.monitor.width * 0.43 + 60
-        btn_w, btn_h = 250, 80
-        # Russian labels for buttons
-        add_label = 'Добавить частицы'
-        apply_label = 'Применить'
-        menu_label = 'Меню'
-        # Place buttons left‑to‑right: Add → Apply → Menu
-        self.buttons = [
-            Button(app, add_label, (base_btn_x + 0 * 290, btn_y), (btn_w, btn_h), self.add_marked_particles),
-            Button(app, apply_label, (base_btn_x + 1 * 290, btn_y), (btn_w, btn_h), self.apply),
-            Button(app, menu_label, (base_btn_x + 2 * 290, btn_y), (btn_w, btn_h), self.to_menu),
-        ]
+        # Layout parameters for the full-width simulation box and the controls row
+        side_margin = 30
+        top_margin = 40
+        screen_width = int(self.app.monitor.width * 0.85)
+        screen_height = int(self.app.monitor.height * 0.85)
+        # Resize the display surface to the reduced dimensions so the layout is predictable
+        self.app.screen = pygame.display.set_mode((screen_width, screen_height))
+        self.screen = self.app.screen
 
         # Load parameter definitions from configuration
-        param_names, sliders_gap, param_poses, param_bounds, param_initial, param_step, par4sim, dec_numbers = self._load_params()
+        param_names, _, _, param_bounds, param_initial, param_step, par4sim, dec_numbers = self._load_params()
         # Preserve the original param bounds for later use (e.g. to size data arrays)
         _original_param_bounds = list(param_bounds)
         # Normalize initial values into [0, 1] interval
@@ -59,12 +53,11 @@ class DemoScreen:
         # entries in ``par4sim``.  When the name_par belongs to the
         # ignore set the slider is omitted.
         ignore_params = {'gamma', 'k', 'm_spring', 'R', 'R_spring'}
-        entries = list(zip(param_names, param_poses, param_bounds, param_initial, param_step, par4sim, dec_numbers))
-        filtered_entries = [e for e in entries if e[5] not in ignore_params]
+        entries = list(zip(param_names, param_bounds, param_initial, param_step, par4sim, dec_numbers))
+        filtered_entries = [e for e in entries if e[4] not in ignore_params]
         if filtered_entries:
-            param_names, param_poses, param_bounds, param_initial, param_step, par4sim, dec_numbers = zip(*filtered_entries)
+            param_names, param_bounds, param_initial, param_step, par4sim, dec_numbers = zip(*filtered_entries)
             param_names = list(param_names)
-            param_poses = list(param_poses)
             param_bounds = list(param_bounds)
             param_initial = list(param_initial)
             param_step = list(param_step)
@@ -72,157 +65,234 @@ class DemoScreen:
             dec_numbers = list(dec_numbers)
         else:
             # No parameters remain after filtering
-            param_names, param_poses, param_bounds, param_initial, param_step, par4sim, dec_numbers = ([], [], [], [], [], [], [])
-        # Create sliders only for the kept simulation parameters
-        self.sliders = [
-            ParamSlider(
-                app,
-                name,
-                pos,
-                bounds,
-                step,
-                name_par,
-                dec_number,
-                button_color=self.bg_color,
-                font='sans',
-                bold=False,
-                fontSize=32,
-                initial_pos=initial,
-            )
-            for name, pos, bounds, initial, step, name_par, dec_number in zip(param_names, param_poses, param_bounds, param_initial, param_step, par4sim, dec_numbers)
+            param_names, param_bounds, param_initial, param_step, par4sim, dec_numbers = ([], [], [], [], [], [])
+
+        # Collect slider definitions (label, bounds, key, etc.)
+        slider_defs = [
+            {
+                'label': name,
+                'bounds': bounds,
+                'initial_pos': initial,
+                'step': step,
+                'key': name_par,
+                'decimals': dec_number,
+            }
+            for name, bounds, initial, step, name_par, dec_number in zip(param_names, param_bounds, param_initial, param_step, par4sim, dec_numbers)
         ]
 
-        # -----------------------------------------------------------------
         # Additional sliders for thermal wall parameters (T_left, T_right) and
         # accommodation coefficient.  These sliders allow the user to adjust
         # the temperatures of the left and right walls and the degree of
         # thermal accommodation (0 = purely specular reflection, 1 = full
-        # thermalization).  Positions are determined relative to the last
-        # existing slider and the configured gap.
-        base_x = param_poses[0][0]
-        base_y = param_poses[-1][1] + sliders_gap
-
-        # Define bounds and initial values for temperatures (in kelvins)
+        # thermalization).
         min_T = 100.0
         max_T = 1000.0
-        # Left wall temperature slider
         initial_T_left = 600.0
         init_pos_T_left = (initial_T_left - min_T) / (max_T - min_T)
         step_T = (max_T - min_T) / 100.0
-        self.slider_T_left = ParamSlider(
-            app,
-            'T_left',
-            (base_x, base_y),
-            (min_T, max_T),
-            step_T,
-            'T_left',
-            0,
-            button_color=self.bg_color,
-            font='sans',
-            bold=False,
-            fontSize=32,
-            initial_pos=init_pos_T_left,
-        )
-        # Right wall temperature slider
         initial_T_right = 300.0
         init_pos_T_right = (initial_T_right - min_T) / (max_T - min_T)
-        self.slider_T_right = ParamSlider(
-            app,
-            'T_right',
-            (base_x, base_y + sliders_gap),
-            (min_T, max_T),
-            step_T,
-            'T_right',
-            0,
-            button_color=self.bg_color,
-            font='sans',
-            bold=False,
-            fontSize=32,
-            initial_pos=init_pos_T_right,
-        )
-        # Accommodation coefficient slider (0 – 1)
         min_accom = 0.0
         max_accom = 1.0
         initial_accom = 1.0
         init_pos_accom = (initial_accom - min_accom) / (max_accom - min_accom)
         step_accom = (max_accom - min_accom) / 100.0
-        self.slider_accommodation = ParamSlider(
-            app,
-            'accommodation',
-            (base_x, base_y + 2 * sliders_gap),
-            (min_accom, max_accom),
-            step_accom,
-            'accommodation',
-            2,
-            button_color=self.bg_color,
-            font='sans',
-            bold=False,
-            fontSize=32,
-            initial_pos=init_pos_accom,
+        slider_defs.extend(
+            [
+                {
+                    'label': 'T_left',
+                    'bounds': (min_T, max_T),
+                    'initial_pos': init_pos_T_left,
+                    'step': step_T,
+                    'key': 'T_left',
+                    'decimals': 0,
+                },
+                {
+                    'label': 'T_right',
+                    'bounds': (min_T, max_T),
+                    'initial_pos': init_pos_T_right,
+                    'step': step_T,
+                    'key': 'T_right',
+                    'decimals': 0,
+                },
+                {
+                    'label': 'accommodation',
+                    'bounds': (min_accom, max_accom),
+                    'initial_pos': init_pos_accom,
+                    'step': step_accom,
+                    'key': 'accommodation',
+                    'decimals': 2,
+                },
+            ]
         )
-        # Append thermal sliders to the main sliders list
-        self.sliders.extend([self.slider_T_left, self.slider_T_right, self.slider_accommodation])
 
-        # -----------------------------------------------------------------
         # Additional sliders for particle size and number of tagged particles.
         # ``slider_size_scale`` controls both the physical and visual radius
         # of gas particles simultaneously.  ``slider_tag_count`` sets the
         # number of marked particles to add when the "Add particles" button
-        # is pressed.  These controls are placed below the thermal sliders.
-        # Slider bounds for particle size scaling (50%–150%).  The user
-        # wanted the upper limit reduced to 1.5 instead of 3.0, and
-        # default particles of size 1.0.
+        # is pressed.
         size_bounds = (0.5, 1.5)
         size_initial = 1.0
         init_pos_size = (size_initial - size_bounds[0]) / (size_bounds[1] - size_bounds[0])
         step_size = (size_bounds[1] - size_bounds[0]) / 100.0
-        # Slider controlling particle size (both physical and visual)
-        self.slider_size_scale = ParamSlider(
-            app,
-            'size_scale',
-            (base_x, base_y + 3 * sliders_gap),
-            size_bounds,
-            step_size,
-            'size_scale',
-            2,
-            button_color=self.bg_color,
-            font='sans',
-            bold=False,
-            fontSize=32,
-            initial_pos=init_pos_size,
-        )
-        # Bounds for number of tagged particles to add
         tag_bounds = (1, 100)
         tag_initial = 10  # default number of tagged particles
         init_pos_tag = (tag_initial - tag_bounds[0]) / (tag_bounds[1] - tag_bounds[0])
         step_tag = 1
-        self.slider_tag_count = ParamSlider(
-            app,
-            'tagged_count',
-            (base_x, base_y + 4 * sliders_gap),
-            tag_bounds,
-            step_tag,
-            'tagged_count',
-            0,
-            button_color=self.bg_color,
-            font='sans',
-            bold=False,
-            fontSize=32,
-            initial_pos=init_pos_tag,
+        slider_defs.extend(
+            [
+                {
+                    'label': 'size_scale',
+                    'bounds': size_bounds,
+                    'initial_pos': init_pos_size,
+                    'step': step_size,
+                    'key': 'size_scale',
+                    'decimals': 2,
+                },
+                {
+                    'label': 'tagged_count',
+                    'bounds': tag_bounds,
+                    'initial_pos': init_pos_tag,
+                    'step': step_tag,
+                    'key': 'tagged_count',
+                    'decimals': 0,
+                },
+            ]
         )
-        # Add the size and tag count sliders to the list
-        self.sliders.extend([self.slider_size_scale, self.slider_tag_count])
 
+        total_sliders = len(slider_defs)
+        if total_sliders:
+            controls_rows = 2 if total_sliders > 2 else total_sliders
+            controls_cols = math.ceil(total_sliders / controls_rows)
+        else:
+            controls_rows = 0
+            controls_cols = 1
+
+        button_height = 50
+        button_area_height = 75   # includes padding around buttons
+        min_sim_height = 200
+        slider_area_height = max(140, controls_rows * 80) if controls_rows else 140
+        controls_height = button_area_height + slider_area_height
+        max_controls_height = screen_height - (top_margin + min_sim_height)
+        if max_controls_height < button_area_height + 100:
+            max_controls_height = button_area_height + 100
+        controls_height = min(controls_height, max_controls_height)
+        controls_top = screen_height - controls_height
+        base_sim_height = screen_height - controls_height - top_margin - 10
+        sim_height = max(min_sim_height, int(base_sim_height * 0.8))
+        controls_top = top_margin + sim_height + 10
+        controls_height = screen_height - controls_top
+        min_controls_height = button_area_height + 70
+        if controls_height < min_controls_height:
+            deficit = min_controls_height - controls_height
+            sim_height = max(min_sim_height, sim_height - deficit)
+            controls_top = top_margin + sim_height + 10
+            controls_height = screen_height - controls_top
+
+        sim_width = screen_width - 2 * side_margin
+
+        # Buttons: Add Particles, Apply changes, Menu. Mode button remains removed.
+        btn_w, btn_h = 190, button_height
+        btn_gap = 16
+        btn_y = controls_top + 8
+        add_label = 'Добавить частицы'
+        apply_label = 'Применить'
+        menu_label = 'Меню'
+        button_specs = [
+            (add_label, self.add_marked_particles),
+            (apply_label, self.apply),
+            (menu_label, self.to_menu),
+        ]
+        self.buttons = [
+            Button(
+                app,
+                label,
+                (side_margin + i * (btn_w + btn_gap), btn_y),
+                (btn_w, btn_h),
+                handler,
+                font='sans',
+                bold=False,
+                fontSize=24,
+            )
+            for i, (label, handler) in enumerate(button_specs)
+        ]
+
+        # Compute slider positions in a grid beneath the buttons
+        slider_start_y = btn_y + btn_h + 15
+        slider_area_bottom = controls_top + controls_height - 10
+        available_slider_height = max(40.0, slider_area_bottom - slider_start_y)
+        slider_positions = []
+        if controls_rows:
+            row_spacing = available_slider_height / controls_rows
+        else:
+            row_spacing = available_slider_height
+        controls_width = screen_width - 2 * side_margin
+        col_spacing = controls_width / controls_cols if controls_cols else controls_width
+        for idx in range(total_sliders):
+            row = idx // controls_cols if controls_cols else 0
+            col = idx % controls_cols if controls_cols else 0
+            cx = side_margin + col_spacing * (col + 0.5)
+            cy = slider_start_y + row_spacing * (row + 0.5)
+            slider_positions.append((int(cx), int(cy)))
+
+        # Instantiate sliders and keep ordered mapping to parameter keys
+        self.sliders: list[ParamSlider] = []
+        self.slider_param_keys: list[str] = []
+        self.slider_T_left = None
+        self.slider_T_right = None
+        self.slider_accommodation = None
+        self.slider_size_scale = None
+        self.slider_tag_count = None
+
+        for index, (definition, position) in enumerate(zip(slider_defs, slider_positions)):
+            slider = ParamSlider(
+                app,
+                definition['label'],
+                position,
+                definition['bounds'],
+                definition['step'],
+                definition['key'],
+                definition['decimals'],
+                button_color=self.bg_color,
+                font='sans',
+                bold=False,
+                fontSize=18,
+                initial_pos=definition['initial_pos'],
+            )
+            self.sliders.append(slider)
+            self.slider_param_keys.append(definition['key'])
+
+            if definition['key'] == 'T_left':
+                self.slider_T_left = slider
+            elif definition['key'] == 'T_right':
+                self.slider_T_right = slider
+            elif definition['key'] == 'accommodation':
+                self.slider_accommodation = slider
+            elif definition['key'] == 'size_scale':
+                self.slider_size_scale = slider
+            elif definition['key'] == 'tagged_count':
+                self.slider_tag_count = slider
+
+        # Ensure we have references for mandatory sliders
+        assert self.slider_T_left is not None and self.slider_T_right is not None
+        assert self.slider_accommodation is not None
+        assert self.slider_size_scale is not None and self.slider_tag_count is not None
+        sim_width = max(100, int(round(sim_width)))
+        sim_height = max(100, int(round(sim_height)))
 
         # Initialize the demonstration with current slider values
+        params_initial = OrderedDict()
+        for key, slider in zip(self.slider_param_keys, self.sliders):
+            params_initial[key] = slider.getValue()
+
         self.demo = Demo(
             app,
-            (app.monitor.width * 0.05 + 30, 30),
-            (app.monitor.width * 0.43, app.monitor.width * 0.43),
+            (int(side_margin), int(top_margin)),
+            (sim_width, sim_height),
             (255, 255, 255),
             (100, 100, 100),
             self.bg_color,
-            {name: sl.getValue() for name, sl in zip(par4sim, self.sliders)},
+            params_initial.copy(),
         )
 
         # Demo configuration used by charts and sliders.  Note that the
@@ -232,32 +302,20 @@ class DemoScreen:
         # includes the parameter that defined the intended length.
         frames_count = _original_param_bounds[-1][1] if _original_param_bounds else 10
         self.demo_config = {
-            'params': {name: sl.getValue() for name, sl in zip(par4sim, self.sliders)},
+            'params': params_initial.copy(),
             'kinetic': [0] * frames_count,
             'mean_kinetic': [0] * frames_count,
             'potential': [0] * frames_count,
             'mean_potential': [0] * frames_count,
             'is_changed': False,
         }
-        # Add thermal parameters (T_left, T_right, accommodation) to params dict
-        # Their values come from the sliders created above
-        self.demo_config['params']['T_left'] = self.slider_T_left.getValue()
-        self.demo_config['params']['T_right'] = self.slider_T_right.getValue()
-        self.demo_config['params']['accommodation'] = self.slider_accommodation.getValue()
-
-        # Add size scale and tagged count parameters to the params dict.
-        # These values are stored for later application but do not directly
-        # affect the simulation until the user presses Apply.
-        self.demo_config['params']['size_scale'] = self.slider_size_scale.getValue()
-        self.demo_config['params']['tagged_count'] = self.slider_tag_count.getValue()
         # No charts are created in this version
         self.graphics = []
         self.slider_grabbed = False
         self.charts_mode = False  # mode toggle unused
 
         # Number of tagged particles to add when the user presses the Add button.
-        # Default changed to 10 in accordance with the requirements.
-        self.tagged_count: int = 10
+        self.tagged_count = int(params_initial.get('tagged_count', 10))
 
     # ---------------------------------------------------------------------
     def correct_limits(self):
