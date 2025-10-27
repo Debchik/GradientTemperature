@@ -132,7 +132,7 @@ class DemoScreen:
         # number of marked particles to add when the "Add particles" button
         # is pressed.
         size_bounds = (0.5, 1.5)
-        size_initial = 1.0
+        size_initial = 1.3
         init_pos_size = (size_initial - size_bounds[0]) / (size_bounds[1] - size_bounds[0])
         step_size = (size_bounds[1] - size_bounds[0]) / 100.0
         tag_bounds = (1, 100)
@@ -158,6 +158,21 @@ class DemoScreen:
                     'decimals': 0,
                 },
             ]
+        )
+
+        slowmo_bounds = (0.1, 1.0)
+        slowmo_initial = 1.0
+        init_pos_slowmo = (slowmo_initial - slowmo_bounds[0]) / (slowmo_bounds[1] - slowmo_bounds[0])
+        step_slowmo = (slowmo_bounds[1] - slowmo_bounds[0]) / 100.0
+        slider_defs.append(
+            {
+                'label': 'Слоумо',
+                'bounds': slowmo_bounds,
+                'initial_pos': init_pos_slowmo,
+                'step': step_slowmo,
+                'key': 'slowmo',
+                'decimals': 2,
+            }
         )
 
         total_sliders = len(slider_defs)
@@ -198,13 +213,20 @@ class DemoScreen:
         add_label = 'Добавить частицы'
         apply_label = 'Применить'
         menu_label = 'Меню'
+        dim_label = 'Затусклить фон'
+        trail_label = 'Показать след'
         button_specs = [
-            (add_label, self.add_marked_particles),
-            (apply_label, self.apply),
-            (menu_label, self.to_menu),
+            (add_label, self.add_marked_particles, None),
+            (dim_label, self.toggle_dim_particles, 'dim_button'),
+            (trail_label, self.toggle_trail, 'trail_button'),
+            (apply_label, self.apply, None),
+            (menu_label, self.to_menu, None),
         ]
-        self.buttons = [
-            Button(
+        self.dim_button = None
+        self.trail_button = None
+        self.buttons = []
+        for i, (label, handler, attr_name) in enumerate(button_specs):
+            btn = Button(
                 app,
                 label,
                 (side_margin + i * (btn_w + btn_gap), btn_y),
@@ -214,8 +236,11 @@ class DemoScreen:
                 bold=False,
                 fontSize=24,
             )
-            for i, (label, handler) in enumerate(button_specs)
-        ]
+            self.buttons.append(btn)
+            if attr_name == 'dim_button':
+                self.dim_button = btn
+            elif attr_name == 'trail_button':
+                self.trail_button = btn
 
         # Compute slider positions in a grid beneath the buttons
         slider_start_y = btn_y + btn_h + 15
@@ -243,6 +268,7 @@ class DemoScreen:
         self.slider_accommodation = None
         self.slider_size_scale = None
         self.slider_tag_count = None
+        self.slider_slowmo = None
 
         for index, (definition, position) in enumerate(zip(slider_defs, slider_positions)):
             slider = ParamSlider(
@@ -272,11 +298,14 @@ class DemoScreen:
                 self.slider_size_scale = slider
             elif definition['key'] == 'tagged_count':
                 self.slider_tag_count = slider
+            elif definition['key'] == 'slowmo':
+                self.slider_slowmo = slider
 
         # Ensure we have references for mandatory sliders
         assert self.slider_T_left is not None and self.slider_T_right is not None
         assert self.slider_accommodation is not None
         assert self.slider_size_scale is not None and self.slider_tag_count is not None
+        assert self.slider_slowmo is not None
         sim_width = max(100, int(round(sim_width)))
         sim_height = max(100, int(round(sim_height)))
 
@@ -294,6 +323,10 @@ class DemoScreen:
             self.bg_color,
             params_initial.copy(),
         )
+        self.dim_active = False
+        self.trail_active = False
+        self.demo.set_dim_untracked(self.dim_active)
+        self.demo.set_trail_enabled(self.trail_active)
 
         # Demo configuration used by charts and sliders.  Note that the
         # number of elements in the data arrays (e.g. kinetic) is
@@ -345,6 +378,9 @@ class DemoScreen:
         # Add button is pressed.  Cast to int to ensure discrete count.
         self.tagged_count = int(self.slider_tag_count.getValue())
         self.demo_config['params']['tagged_count'] = self.tagged_count
+        slowmo_val = float(self.slider_slowmo.getValue())
+        self.demo.set_time_scale(slowmo_val)
+        self.demo_config['params']['slowmo'] = slowmo_val
         # Without charts, just refresh the simulation.  ``_refresh_iter``
         # will update changed parameters (like number of particles) via
         # ``Demo.set_params`` if needed.
@@ -365,6 +401,22 @@ class DemoScreen:
             self.demo_config['params']['r'] += self.tagged_count
         # Mark the config as changed so that the next refresh recomputes values
         self.demo_config['is_changed'] = True
+
+    def toggle_dim_particles(self):
+        """Toggle dimming of untagged particles for easier tracking."""
+        self.dim_active = not self.dim_active
+        self.demo.set_dim_untracked(self.dim_active)
+        if self.dim_button is not None:
+            new_label = 'Вернуть цвета' if self.dim_active else 'Затусклить фон'
+            self.dim_button._prep_msg(new_label)
+
+    def toggle_trail(self):
+        """Toggle trajectory drawing for the highlighted tagged particle."""
+        self.trail_active = not self.trail_active
+        self.demo.set_trail_enabled(self.trail_active)
+        if self.trail_button is not None:
+            new_label = 'Скрыть след' if self.trail_active else 'Показать след'
+            self.trail_button._prep_msg(new_label)
 
     def modes(self):
         """Toggle chart display mode (no‑op)."""
@@ -396,6 +448,7 @@ class DemoScreen:
     def _update_screen(self):
         self.screen.fill(self.bg_color)
         self.demo.draw_check(self.demo_config)
+        self._draw_counters()
         for button in self.buttons:
             button.draw_button()
         for slider in self.sliders:
@@ -443,6 +496,22 @@ class DemoScreen:
             fig.draw(self.demo_config)
         # Synchronize y‑limits (unused)
         self.correct_limits()
+
+    def _draw_counters(self):
+        """Render counters showing how many tagged particles hit each wall."""
+        if not self.demo.has_tagged_particles():
+            return
+        left_hits, right_hits = self.demo.get_wall_hit_counts()
+        left_text = f'Левая: {left_hits}'
+        right_text = f'Правая: {right_hits}'
+        left_surface = self.middle_font.render(left_text, True, (220, 70, 40))
+        right_surface = self.middle_font.render(right_text, True, (60, 130, 255))
+        padding = 10
+        top_y = self.demo.position[1] + padding
+        left_x = self.demo.position[0] + padding
+        right_x = self.demo.position[0] + self.demo.width - right_surface.get_width() - padding
+        self.screen.blit(left_surface, (left_x, top_y))
+        self.screen.blit(right_surface, (right_x, top_y))
 
 
 def _init_val_into_unit(initial_val, bounds) -> float:

@@ -11,6 +11,7 @@ potential energy arrays remain for compatibility but will contain zeroes.
 import pygame
 import numpy as np
 import config
+from typing import Optional
 from simulation import Simulation
 
 
@@ -60,19 +61,13 @@ class Demo:
         self.modified_par = None
         loader = config.ConfigLoader()
 
-        # Factor by which the physical radius is scaled up.  Multiplying
-        # ``loader["R_size"]`` by this factor increases the actual
-        # collision radius of the particles.  Set the default scale to
-        # 1.0 so that particles start with the nominal radius from
-        # configuration.  Increasing the physical radius while keeping
-        # time step constant may require care in simulation stability;
-        # positional correction is already in place.
-        self.physical_radius_scale = 1.0
-
-        # Factor to scale the physical radius when drawing.  Setting this
-        # near 1.0 makes the particles appear the same size as their
-        # physical collision radius.  Lower values shrink them visually.
-        self.draw_radius_factor = 1.0
+        # Scale factors for physical collisions and rendering.  Start 30% larger
+        # to make particles more visible by default.
+        initial_scale = float(params.get('size_scale', 1.3))
+        if initial_scale < 0.1:
+            initial_scale = 0.1
+        self.physical_radius_scale = initial_scale
+        self.draw_radius_factor = initial_scale
 
         # Keep track of indices of tagged (marked) particles.  These will
         # be drawn in a distinct colour and can be analysed separately.
@@ -81,7 +76,22 @@ class Demo:
         # drawn in a distinct colour.  According to the latest
         # requirements the marked particles should appear bright yellow
         # to stand out against the temperature gradient colours.
-        self.tagged_color: tuple[int, int, int] = (255, 165, 0)
+        self.tagged_color: tuple[int, int, int] = (255, 220, 0)
+        # Rendering helpers for highlight/dim features
+        self.dim_untracked: bool = False
+        self.dim_color: tuple[int, int, int] = (90, 90, 100)
+
+        # Trajectory tracking for a tagged particle
+        self.trail_enabled: bool = False
+        self.trail_points: list[tuple[int, int]] = []
+        self.max_trail_points: int = 600
+        self.tracked_particle_id: Optional[int] = None
+
+        # Counters for wall contacts by tagged particles
+        self.wall_hits = {'left': 0, 'right': 0}
+
+        # Slow-motion control: multiplier applied to the integrator step
+        self.time_scale: float = float(params.get('slowmo', 1.0))
 
         # Masses for gas particles only.  ``self.params['r']`` specifies the
         # number of gas particles; there are no spring masses in this
@@ -126,6 +136,9 @@ class Demo:
                 accommodation=accom,
             )
 
+        # Apply the initial slow-motion factor after the simulation is created.
+        self.simulation.set_time_scale(self.time_scale)
+
     def update_radius_scale(self, scale: float) -> None:
         """
         Update both the physical and visual radius scales of the particles.
@@ -156,6 +169,76 @@ class Demo:
         # Update the simulation with the new radius
         self.simulation.set_params(R=new_R)
 
+    def set_time_scale(self, scale: float) -> None:
+        """Expose slow-motion control for the simulation loop."""
+        if scale < 0.05:
+            scale = 0.05
+        self.time_scale = float(scale)
+        self.simulation.set_time_scale(self.time_scale)
+
+    def set_dim_untracked(self, dim: bool) -> None:
+        """Enable or disable dimming of untagged particles."""
+        self.dim_untracked = bool(dim)
+
+    def set_trail_enabled(self, enabled: bool) -> None:
+        """Toggle trajectory rendering for the tracked tagged particle."""
+        new_state = bool(enabled)
+        if new_state and not self.trail_enabled:
+            # Reset trail when enabling to avoid stale points.
+            self.trail_points.clear()
+        if not new_state:
+            self.trail_points.clear()
+        self.trail_enabled = new_state
+        self._ensure_tracked_particle()
+
+    def has_tagged_particles(self) -> bool:
+        """Return True when at least one tagged particle exists."""
+        return bool(self.tagged_indices)
+
+    def get_wall_hit_counts(self) -> tuple[int, int]:
+        """Return accumulated counts of tagged particles hitting left/right walls."""
+        return self.wall_hits['left'], self.wall_hits['right']
+
+    def _ensure_tracked_particle(self) -> None:
+        """Ensure the tracked particle id refers to an existing tagged particle."""
+        if not self.tagged_indices:
+            self.tracked_particle_id = None
+            return
+        if self.tracked_particle_id not in self.tagged_indices:
+            # Prefer the earliest tagged particle for consistency.
+            self.tracked_particle_id = self.tagged_indices[0]
+            self.trail_points.clear()
+
+    def _update_wall_hit_counters(self) -> None:
+        """Increment counters when tagged particles touch left/right walls."""
+        if not self.tagged_indices:
+            return
+        tagged_set = set(self.tagged_indices)
+        hits = self.simulation.get_last_wall_hits()
+        for idx in hits.get('left', []):
+            if int(idx) in tagged_set:
+                self.wall_hits['left'] += 1
+        for idx in hits.get('right', []):
+            if int(idx) in tagged_set:
+                self.wall_hits['right'] += 1
+
+    def _record_trail_point(self, pixel_positions: np.ndarray) -> None:
+        """Append the current screen-space position of the tracked particle."""
+        if not self.trail_enabled:
+            return
+        self._ensure_tracked_particle()
+        if self.tracked_particle_id is None:
+            return
+        idx = int(self.tracked_particle_id)
+        if idx >= pixel_positions.shape[1]:
+            return
+        point = (int(pixel_positions[0, idx]), int(pixel_positions[1, idx]))
+        if self.trail_points and self.trail_points[-1] == point:
+            return
+        self.trail_points.append(point)
+        if len(self.trail_points) > self.max_trail_points:
+            self.trail_points.pop(0)
+
     def set_params(self, params, par):
         # Dispatch updated simulation parameters based on the changed
         # parameter name.  Legacy parameters such as ``gamma`` and ``k``
@@ -166,76 +249,126 @@ class Demo:
             self.simulation.set_params(T=params['T'])
         elif par == 'r':
             self.simulation.set_params(particles_cnt=params['r'])
+        elif par == 'slowmo':
+            self.set_time_scale(params['slowmo'])
         # ignore any other parameters (gamma, k, R, etc.)
 
     def draw_check(self, params):
         # Draw background box
         pygame.draw.rect(self.screen, self.bg_color, self.main)
-        # Detect parameter changes
+
+        # Detect parameter changes and reset change flag per frame
+        params['is_changed'] = False
+        self.modified_par = None
         for i, par1, par2 in zip(range(len(self.params)), params['params'].values(), self.params.values()):
             if abs(par1 - par2) > 1e-4:
                 self.modified_par = list(self.params.keys())[i]
                 params['is_changed'] = True
                 break
 
+        # Apply slow-motion factor immediately when it changes
+        slowmo_value = float(params['params'].get('slowmo', self.time_scale))
+        if abs(slowmo_value - self.time_scale) > 1e-4:
+            self.set_time_scale(slowmo_value)
+
         # Advance simulation and record energies
         loader = config.ConfigLoader()
-        new_args = next(self.simulation)
-        for i in range(params['params']['speed']):
+        speed_raw = params['params'].get('speed', 1)
+        try:
+            steps = int(max(1, round(speed_raw)))
+        except (TypeError, ValueError):
+            steps = 1
+
+        new_args = None
+        for i in range(steps):
             new_args = next(self.simulation)
-            # Assign direct float values; the simulation returns Python floats
-            params['kinetic'][i] = self.simulation.calc_kinetic_energy()
-            params['potential'][i] = self.simulation.calc_potential_energy()
-            params['mean_kinetic'][i] = self.simulation.mean_kinetic_energy(loader['sim_avg_frames_c'])
-            params['mean_potential'][i] = self.simulation.mean_potential_energy(loader['sim_avg_frames_c'])
-        for i in range(params['params']['speed'], len(params['kinetic'])):
+            self._update_wall_hit_counters()
+            if i < len(params['kinetic']):
+                params['kinetic'][i] = self.simulation.calc_kinetic_energy()
+                params['potential'][i] = self.simulation.calc_potential_energy()
+                params['mean_kinetic'][i] = self.simulation.mean_kinetic_energy(loader['sim_avg_frames_c'])
+                params['mean_potential'][i] = self.simulation.mean_potential_energy(loader['sim_avg_frames_c'])
+        for i in range(steps, len(params['kinetic'])):
             params['kinetic'][i] = -1
             params['potential'][i] = -1
             params['mean_kinetic'][i] = -1
             params['mean_potential'][i] = -1
 
+        if new_args is None:
+            new_args = (
+                self.simulation.r,
+                self.simulation.r_spring,
+                self.simulation.v,
+                self.simulation.v_spring,
+                0.0,
+            )
+
         # Unpack positions; r_spring is empty
-        r = new_args[0].copy()
-        # Determine draw radii
-        # Convert physical radius (0–1) to pixel radius.  Multiply by
-        # ``draw_radius_factor`` to make particles visually smaller than
-        # their physical size to reduce apparent overlap in the UI.
+        r = np.array(new_args[0], copy=True)
+        # Determine draw radii. Convert physical radius (0–1) to pixel radius.
         scale = min(self.width, self.height)
         r_radius = scale * self.simulation.R * self.draw_radius_factor
+
+        # Draw coloured wall strips before overlaying particles
+        wall_thickness = max(6, int(round(self.width * 0.015)))
+        left_wall_rect = pygame.Rect(self.position[0], self.position[1], wall_thickness, self.height)
+        right_wall_rect = pygame.Rect(
+            self.position[0] + self.width - wall_thickness,
+            self.position[1],
+            wall_thickness,
+            self.height,
+        )
+        pygame.draw.rect(self.screen, (220, 70, 40), left_wall_rect)
+        pygame.draw.rect(self.screen, (60, 130, 255), right_wall_rect)
+
         # Transform positions from unit box to screen coordinates
         r[0] = self.pos_start[0] + r[0] * self.width
         r[1] = self.pos_start[1] - r[1] * self.height
-        r = np.round(r)
+        r = np.round(r).astype(int)
         r_radius = max(1, int(round(r_radius)))
-        # Compute velocities and speed magnitudes for color mapping
-        # new_args[2] corresponds to velocities (2×N array)
+
+        # Compute velocities and speed magnitudes for colour mapping
         v = new_args[2] if isinstance(new_args, (list, tuple)) and len(new_args) >= 3 else self.simulation.v
-        # Speed (scalar) per particle
         speeds = np.linalg.norm(v, axis=0)
-        # Normalize speeds between 0 and 1 for color interpolation
         if speeds.size > 0:
             v_min = float(np.min(speeds))
             v_max = float(np.max(speeds))
-            # Avoid division by zero
             denom = v_max - v_min if v_max > v_min else 1.0
             normalized = (speeds - v_min) / denom
         else:
             normalized = np.zeros_like(speeds)
-        # Precompute a set for faster membership checks of tagged particles
+
+        # Store the current position of the tracked particle for the trail feature
+        self._record_trail_point(r)
+
+        # Precompute sets for tagged particles and highlight handling
         tagged_set = set(self.tagged_indices)
-        # Draw gas particles: use separate colour for tagged particles
+
+        # Draw gas particles with dimming/highlighting options
         for idx in range(r.shape[1]):
+            point = (int(r[0, idx]), int(r[1, idx]))
             if idx in tagged_set:
-                # Tagged particles are drawn in a distinct colour (self.tagged_color)
                 color = self.tagged_color
+            elif self.dim_untracked:
+                color = self.dim_color
             else:
-                # Map speed to colour: blue (cold) → red (hot)
-                c = float(normalized[idx])
-                red   = int(255 * c)
+                c = float(normalized[idx]) if normalized.size else 0.0
+                red = int(255 * c)
                 green = 0
-                blue  = int(255 * (1.0 - c))
+                blue = int(255 * (1.0 - c))
                 color = (red, green, blue)
-            pygame.draw.circle(self.screen, color, tuple(r[:, idx]), r_radius)
+            pygame.draw.circle(self.screen, color, point, r_radius)
+
+        # Draw trajectory trail over the particles so it remains visible
+        if self.trail_enabled and len(self.trail_points) >= 2:
+            pygame.draw.lines(self.screen, self.tagged_color, False, self.trail_points, 2)
+
+        if self.trail_enabled:
+            self._ensure_tracked_particle()
+        if self.tracked_particle_id is not None and self.tracked_particle_id < r.shape[1]:
+            focus_point = (int(r[0, self.tracked_particle_id]), int(r[1, self.tracked_particle_id]))
+            pygame.draw.circle(self.screen, (255, 255, 255), focus_point, r_radius + 3, 2)
+
         # Draw border
         inner_border = 3
         mask_border = 50
@@ -315,6 +448,9 @@ class Demo:
         # Record tagged indices
         new_indices = list(range(n_old, n_old + count))
         self.tagged_indices.extend(new_indices)
+        self._ensure_tracked_particle()
+        if self.trail_enabled:
+            self.trail_points.clear()
         # Update parameter dictionary to reflect increased number of particles
         if 'r' in self.params:
             self.params['r'] += count

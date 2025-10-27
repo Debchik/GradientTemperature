@@ -24,7 +24,7 @@ import itertools
 import math
 import random
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Dict, Tuple, Union
 
 import numpy as np
 from numpy import ndarray
@@ -134,16 +134,14 @@ def reflect_with_accommodation(
     masses: np.ndarray,
     mask: np.ndarray,
 ) -> None:
-    """Apply partial diffusive reflection to a set of particles hitting a wall.
+    """Apply thermal reflection rules when particles collide with a wall.
 
-    This function operates in place on the supplied velocity arrays.  Only
-    the elements selected by ``mask`` are modified.  For the left and
-    right walls, the incoming normal velocity component is partially
-    replaced by a sample drawn from a Maxwell–Smoluchowski distribution
-    corresponding to the wall temperature.  The tangential component is
-    similarly mixed with a thermal sample.  For the top and bottom
-    walls, purely specular reflection is applied (normal velocity
-    component is sign‑flipped).
+    Only the elements selected by ``mask`` are modified.  For the top and
+    bottom walls a specular reflection is performed.  For the left and
+    right walls, the tangential component follows the specular law while
+    the normal component is blended between the specular reflection and a
+    thermal velocity sampled from the Maxwell–Smoluchowski distribution
+    at the wall temperature.
 
     Parameters
     ----------
@@ -178,20 +176,20 @@ def reflect_with_accommodation(
     # Local normal is +x for left wall and -x for right wall.
     if side == 'left':
         v_n_in = -vx[mask]  # incoming normal (>0 toward wall)
-        v_t_in = vy[mask]
-        v_n_new, v_t_new = sample_velocity_from_wall(T_wall, masses[mask])
-        v_n_out = (1.0 - a) * v_n_in + a * v_n_new
-        v_t_out = (1.0 - a) * v_t_in + a * v_t_new
-        vx[mask] = v_n_out
-        vy[mask] = v_t_out
+        v_spec = v_n_in  # specular reflection would give +v_n_in
+        v_n_new, _ = sample_velocity_from_wall(T_wall, masses[mask])
+        v_n_out = (1.0 - a) * v_spec + a * v_n_new
+        # Ensure outward motion (positive vx)
+        vx[mask] = np.abs(v_n_out)
+        # Tangential component follows specular reflection (no change)
     elif side == 'right':
         v_n_in = vx[mask]
-        v_t_in = vy[mask]
-        v_n_new, v_t_new = sample_velocity_from_wall(T_wall, masses[mask])
-        v_n_out = (1.0 - a) * v_n_in + a * v_n_new
-        v_t_out = (1.0 - a) * v_t_in + a * v_t_new
-        vx[mask] = -v_n_out
-        vy[mask] = v_t_out
+        v_spec = -v_n_in  # specular reflection would give -v_n_in
+        v_n_new, _ = sample_velocity_from_wall(T_wall, masses[mask])
+        v_n_out = (1.0 - a) * v_spec - a * v_n_new
+        # Ensure outward motion (negative vx)
+        vx[mask] = -np.abs(v_n_out)
+        # Tangential component follows specular reflection (no change)
 
 
 @dataclass
@@ -308,8 +306,18 @@ class Simulation:
 
         # Frame counter for energy fixes (unused, kept for API compatibility)
         self._frame_no: int = 1
-        # Base integration time step (can be tweaked later if needed)
-        self._dt: float = TIME_STEP
+        # Base integration time step and current scaling factor (slow-mo support)
+        self._base_dt: float = TIME_STEP
+        self._time_scale: float = 1.0
+        self._dt: float = self._base_dt * self._time_scale
+
+        # Track particle indices that touched each wall during the last step
+        self._last_wall_hits: Dict[str, np.ndarray] = {
+            'left': np.empty(0, dtype=int),
+            'right': np.empty(0, dtype=int),
+            'top': np.empty(0, dtype=int),
+            'bottom': np.empty(0, dtype=int),
+        }
 
     # -------------------------------------------------------------------------
     # Properties to expose slices of the state
@@ -352,6 +360,29 @@ class Simulation:
     def R_spring(self) -> float:
         """Radius of spring particles (zero since none exist)."""
         return 0.0
+
+    # -------------------------------------------------------------------------
+    # Time scaling helpers ----------------------------------------------------
+    def set_time_scale(self, scale: float) -> None:
+        """Adjust integration step multiplier used for slow-motion or speed-up."""
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError):
+            scale = 1.0
+        if not math.isfinite(scale):
+            scale = 1.0
+        # Clamp to a sensible range to keep the integrator stable
+        scale = float(np.clip(scale, 0.05, 5.0))
+        self._time_scale = scale
+        self._dt = self._base_dt * self._time_scale
+
+    def get_time_scale(self) -> float:
+        """Return the current integration step multiplier."""
+        return self._time_scale
+
+    def get_last_wall_hits(self) -> Dict[str, np.ndarray]:
+        """Return indices of particles that touched each wall during the last step."""
+        return {side: hits.copy() for side, hits in self._last_wall_hits.items()}
 
     # -------------------------------------------------------------------------
     # Thermodynamic properties
@@ -474,21 +505,32 @@ class Simulation:
         vy = self._v[1]
         masses = self._m
 
+        min_x = self._R
+        max_x = 1.0 - self._R
+        min_y = self._R
+        max_y = 1.0 - self._R
+
         # Compute masks for each wall.  Particles must be moving toward the wall.
-        mask_left = (x < 0.0) & (vx < 0.0)
-        mask_right = (x > 1.0) & (vx > 0.0)
-        mask_bottom = (y < 0.0) & (vy < 0.0)
-        mask_top = (y > 1.0) & (vy > 0.0)
+        mask_left = (x <= min_x) & (vx < 0.0)
+        mask_right = (x >= max_x) & (vx > 0.0)
+        mask_bottom = (y <= min_y) & (vy < 0.0)
+        mask_top = (y >= max_y) & (vy > 0.0)
+
+        # Remember which particles touched the walls this step
+        self._last_wall_hits['left'] = np.where(mask_left)[0]
+        self._last_wall_hits['right'] = np.where(mask_right)[0]
+        self._last_wall_hits['bottom'] = np.where(mask_bottom)[0]
+        self._last_wall_hits['top'] = np.where(mask_top)[0]
 
         # Reposition any particles that penetrated the wall back onto the boundary
         if np.any(mask_left):
-            x[mask_left] = 0.0 + self._R
+            x[mask_left] = min_x
         if np.any(mask_right):
-            x[mask_right] = 1.0 - self._R
+            x[mask_right] = max_x
         if np.any(mask_bottom):
-            y[mask_bottom] = 0.0 + self._R
+            y[mask_bottom] = min_y
         if np.any(mask_top):
-            y[mask_top] = 1.0 - self._R
+            y[mask_top] = max_y
 
         # Apply reflection or thermalization
         reflect_with_accommodation(vx, vy, 'left', self.T_left, self.accommodation, masses, mask_left)
