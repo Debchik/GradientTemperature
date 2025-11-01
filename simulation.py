@@ -318,6 +318,19 @@ class Simulation:
             'top': np.empty(0, dtype=int),
             'bottom': np.empty(0, dtype=int),
         }
+        self._midplane_position: float = 0.5
+        self._last_midplane_flux: float = 0.0
+        self._last_midplane_crossings: Dict[str, np.ndarray] = {
+            'left_to_right': np.empty(0, dtype=int),
+            'right_to_left': np.empty(0, dtype=int),
+        }
+        self._last_midplane_counts: Dict[str, int] = {
+            'left_to_right': 0,
+            'right_to_left': 0,
+        }
+        self._flux_history: list[Tuple[float, float]] = []
+        self._max_flux_history: int = 5000
+        self._elapsed_time: float = 0.0
 
     # -------------------------------------------------------------------------
     # Properties to expose slices of the state
@@ -383,6 +396,26 @@ class Simulation:
     def get_last_wall_hits(self) -> Dict[str, np.ndarray]:
         """Return indices of particles that touched each wall during the last step."""
         return {side: hits.copy() for side, hits in self._last_wall_hits.items()}
+
+    def get_last_midplane_flux(self) -> float:
+        """Return the most recent net flux through the midplane."""
+        return self._last_midplane_flux
+
+    def get_last_midplane_counts(self) -> Dict[str, int]:
+        """Return counts of crossings through the midplane for the last step."""
+        return self._last_midplane_counts.copy()
+
+    def get_midplane_crossings(self) -> Dict[str, np.ndarray]:
+        """Return indices of particles that crossed the midplane in the last step."""
+        return {side: indices.copy() for side, indices in self._last_midplane_crossings.items()}
+
+    def get_midplane_flux_history(self) -> list[Tuple[float, float]]:
+        """Return a shallow copy of the recorded flux history."""
+        return list(self._flux_history)
+
+    def get_elapsed_time(self) -> float:
+        """Return the total elapsed simulation time."""
+        return self._elapsed_time
 
     # -------------------------------------------------------------------------
     # Thermodynamic properties
@@ -540,7 +573,9 @@ class Simulation:
 
         # ------------------------------------------------------------------
         # Integrate positions
+        prev_x = self._r[0].copy()
         self._r += self._v * dt
+        self._update_midplane_flux(prev_x, dt)
 
         # ------------------------------------------------------------------
         return 0.0
@@ -565,6 +600,38 @@ class Simulation:
             self._fix_energy()
 
         return self.r, self.r_spring, self.v, self.v_spring, f
+
+    # -------------------------------------------------------------------------
+    def _update_midplane_flux(self, prev_x: np.ndarray, dt: float) -> None:
+        """Update net particle flux across the midplane based on the last step."""
+        plane = self._midplane_position
+        new_x = self._r[0]
+        prev_x_arr = np.asarray(prev_x, dtype=float)
+        if prev_x_arr.shape != new_x.shape:
+            prev_x_arr = np.reshape(prev_x_arr, new_x.shape)
+        left_to_right_mask = (prev_x_arr < plane) & (new_x >= plane)
+        right_to_left_mask = (prev_x_arr > plane) & (new_x <= plane)
+        left_to_right = np.nonzero(left_to_right_mask)[0]
+        right_to_left = np.nonzero(right_to_left_mask)[0]
+
+        self._last_midplane_crossings['left_to_right'] = left_to_right
+        self._last_midplane_crossings['right_to_left'] = right_to_left
+
+        ltr_count = int(left_to_right.size)
+        rtl_count = int(right_to_left.size)
+        self._last_midplane_counts['left_to_right'] = ltr_count
+        self._last_midplane_counts['right_to_left'] = rtl_count
+
+        net_crossings = ltr_count - rtl_count
+        self._last_midplane_flux = net_crossings / dt if dt > 0.0 else 0.0
+
+        # Record time and flux samples for later analysis/visualisation
+        if dt > 0.0:
+            self._elapsed_time += dt
+        timestamp = self._elapsed_time
+        self._flux_history.append((timestamp, self._last_midplane_flux))
+        if len(self._flux_history) > self._max_flux_history:
+            self._flux_history.pop(0)
 
     # -------------------------------------------------------------------------
     def _update_available(self, arr: ndarray, sub_arr: ndarray) -> ndarray:

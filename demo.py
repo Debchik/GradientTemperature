@@ -8,6 +8,7 @@ parameters for the spring (``R``, ``m_spring``) are ignored.  The
 potential energy arrays remain for compatibility but will contain zeroes.
 """
 
+import math
 import pygame
 import numpy as np
 import config
@@ -16,7 +17,17 @@ from simulation import Simulation
 
 
 class Demo:
-    def __init__(self, app, position, demo_size, bg_color, border_color, bg_screen_color, params):
+    def __init__(
+        self,
+        app,
+        position,
+        demo_size,
+        bg_color,
+        border_color,
+        bg_screen_color,
+        params,
+        wall_temp_bounds: tuple[float, float] | None = None,
+    ):
         """
         Initialize a new demonstration instance.
 
@@ -48,6 +59,11 @@ class Demo:
         self.width, self.height = demo_size
         # Pixel coordinates of the bottom‑left corner of the simulation area (used for transforms)
         self.pos_start = position[0], position[1] + self.height
+        if wall_temp_bounds and wall_temp_bounds[1] > wall_temp_bounds[0]:
+            self.wall_temp_bounds = (float(wall_temp_bounds[0]), float(wall_temp_bounds[1]))
+        else:
+            self.wall_temp_bounds = (100.0, 1000.0)
+        self._wall_colors = {'left': (220, 70, 40), 'right': (60, 130, 255)}
         # Copy of the initial parameter values used by sliders
         # Copy of the initial parameter values used by sliders.  Remove keys
         # corresponding to unused simulation parameters (gamma, k, mass of spring,
@@ -89,6 +105,11 @@ class Demo:
 
         # Counters for wall contacts by tagged particles
         self.wall_hits = {'left': 0, 'right': 0}
+        # Flux tracking across the midplane (x = 0.5)
+        self.midplane_position: float = 0.5
+        self.midplane_flux_samples: list[tuple[float, float]] = []
+        self.max_flux_samples: int = 2000
+        self.reset_wall_hit_counters()
 
         # Slow-motion control: multiplier applied to the integrator step
         self.time_scale: float = float(params.get('slowmo', 1.0))
@@ -139,6 +160,22 @@ class Demo:
         # Apply the initial slow-motion factor after the simulation is created.
         self.simulation.set_time_scale(self.time_scale)
 
+    def _temperature_to_color(self, temperature: float) -> tuple[int, int, int]:
+        """
+        Map a wall temperature to the same blue-to-red gradient used for particles.
+        """
+        min_temp, max_temp = self.wall_temp_bounds
+        span = max(1e-6, max_temp - min_temp)
+        norm = (float(temperature) - min_temp) / span
+        norm = max(0.0, min(1.0, norm))
+        red = int(round(255 * norm))
+        blue = int(round(255 * (1.0 - norm)))
+        return red, 0, blue
+
+    def get_wall_color(self, side: str) -> tuple[int, int, int]:
+        """Return the most recently rendered colour for the given wall."""
+        return self._wall_colors.get(side, (255, 255, 255))
+
     def update_radius_scale(self, scale: float) -> None:
         """
         Update both the physical and visual radius scales of the particles.
@@ -176,6 +213,14 @@ class Demo:
         self.time_scale = float(scale)
         self.simulation.set_time_scale(self.time_scale)
 
+    def resize_viewport(self, position: tuple[int, int], demo_size: tuple[int, int]) -> None:
+        """Adjust the rendering viewport to a new rectangle."""
+        self.position = position
+        self.main = pygame.Rect(*position, *demo_size)
+        self.width, self.height = demo_size
+        self.pos_start = position[0], position[1] + self.height
+        self.screen = pygame.display.get_surface()
+
     def set_dim_untracked(self, dim: bool) -> None:
         """Enable or disable dimming of untagged particles."""
         self.dim_untracked = bool(dim)
@@ -198,6 +243,11 @@ class Demo:
     def get_wall_hit_counts(self) -> tuple[int, int]:
         """Return accumulated counts of tagged particles hitting left/right walls."""
         return self.wall_hits['left'], self.wall_hits['right']
+
+    def reset_wall_hit_counters(self) -> None:
+        """Clear stored hit counts for both walls."""
+        self.wall_hits['left'] = 0
+        self.wall_hits['right'] = 0
 
     def _ensure_tracked_particle(self) -> None:
         """Ensure the tracked particle id refers to an existing tagged particle."""
@@ -238,6 +288,34 @@ class Demo:
         self.trail_points.append(point)
         if len(self.trail_points) > self.max_trail_points:
             self.trail_points.pop(0)
+
+    def _store_flux_sample(self, timestamp: float, value: float) -> None:
+        """Cache the latest net flux value for future visualisation."""
+        if not math.isfinite(timestamp) or not math.isfinite(value):
+            return
+        if self.midplane_flux_samples and abs(self.midplane_flux_samples[-1][0] - timestamp) < 1e-9:
+            self.midplane_flux_samples[-1] = (timestamp, value)
+        else:
+            self.midplane_flux_samples.append((timestamp, value))
+        if len(self.midplane_flux_samples) > self.max_flux_samples:
+            self.midplane_flux_samples.pop(0)
+
+    def _draw_midplane_wall(self) -> None:
+        """Render a semi-transparent dashed divider at the domain centre."""
+        wall_width = max(3, int(round(self.width * 0.012)))
+        dash_length = max(10, int(round(self.height * 0.06)))
+        gap_length = max(6, int(round(dash_length * 0.6)))
+        wall_surface = pygame.Surface((wall_width, self.height), pygame.SRCALPHA)
+        center_x = wall_width // 2
+        color = (182, 186, 198, 215)
+        y = 0
+        while y < self.height:
+            end_y = min(self.height, y + dash_length)
+            pygame.draw.line(wall_surface, color, (center_x, y), (center_x, end_y), wall_width)
+            y = end_y + gap_length
+        wall_x = self.position[0] + int(round(self.width * self.midplane_position)) - wall_width // 2
+        wall_x = max(self.position[0], min(self.position[0] + self.width - wall_width, wall_x))
+        self.screen.blit(wall_surface, (wall_x, self.position[1]))
 
     def set_params(self, params, par):
         # Dispatch updated simulation parameters based on the changed
@@ -318,8 +396,26 @@ class Demo:
             wall_thickness,
             self.height,
         )
-        pygame.draw.rect(self.screen, (220, 70, 40), left_wall_rect)
-        pygame.draw.rect(self.screen, (60, 130, 255), right_wall_rect)
+        param_values = params.get('params') if isinstance(params, dict) else None
+        left_temp_raw = self.simulation.T_left
+        right_temp_raw = self.simulation.T_right
+        if isinstance(param_values, dict):
+            left_temp_raw = param_values.get('T_left', left_temp_raw)
+            right_temp_raw = param_values.get('T_right', right_temp_raw)
+        try:
+            left_temp = float(left_temp_raw)
+        except (TypeError, ValueError):
+            left_temp = float(self.simulation.T_left)
+        try:
+            right_temp = float(right_temp_raw)
+        except (TypeError, ValueError):
+            right_temp = float(self.simulation.T_right)
+        left_color = self._temperature_to_color(left_temp)
+        right_color = self._temperature_to_color(right_temp)
+        self._wall_colors['left'] = left_color
+        self._wall_colors['right'] = right_color
+        pygame.draw.rect(self.screen, left_color, left_wall_rect)
+        pygame.draw.rect(self.screen, right_color, right_wall_rect)
 
         # Transform positions from unit box to screen coordinates
         r[0] = self.pos_start[0] + r[0] * self.width
@@ -340,6 +436,9 @@ class Demo:
 
         # Store the current position of the tracked particle for the trail feature
         self._record_trail_point(r)
+        flux_timestamp = self.simulation.get_elapsed_time()
+        flux_value = self.simulation.get_last_midplane_flux()
+        self._store_flux_sample(flux_timestamp, flux_value)
 
         # Precompute sets for tagged particles and highlight handling
         tagged_set = set(self.tagged_indices)
@@ -368,6 +467,8 @@ class Demo:
         if self.tracked_particle_id is not None and self.tracked_particle_id < r.shape[1]:
             focus_point = (int(r[0, self.tracked_particle_id]), int(r[1, self.tracked_particle_id]))
             pygame.draw.circle(self.screen, (255, 255, 255), focus_point, r_radius + 3, 2)
+
+        self._draw_midplane_wall()
 
         # Draw border
         inner_border = 3
@@ -400,6 +501,85 @@ class Demo:
             self.set_params(params['params'], self.modified_par)
             self.params[self.modified_par] = params['params'][self.modified_par]
 
+    def draw_midplane_flux_graph(
+        self,
+        target_surface: pygame.Surface,
+        rect: pygame.Rect,
+        samples: Optional[list[tuple[float, float]]] = None,
+        line_color: tuple[int, int, int] = (90, 180, 255),
+        baseline_color: tuple[int, int, int] = (180, 180, 180),
+        background: Optional[tuple[int, int, int, int]] = (0, 0, 0, 0),
+    ) -> None:
+        """
+        Render a step-style graph of the recorded midplane flux values.
+
+        The function draws onto ``target_surface`` but does not blit the
+        result to the on-screen display.  This lets callers integrate the
+        graph into their own layout later.
+        """
+        data = self.midplane_flux_samples if samples is None else samples
+        rect = pygame.Rect(rect)
+        if len(data) < 2 or rect.width <= 1 or rect.height <= 1:
+            return
+
+        times = [float(t) for t, _ in data]
+        values = [float(v) for _, v in data]
+        t_min = times[0]
+        t_max = times[-1]
+        if not math.isfinite(t_min) or not math.isfinite(t_max) or t_max <= t_min:
+            return
+
+        v_min = min(values)
+        v_max = max(values)
+        if not (math.isfinite(v_min) and math.isfinite(v_max)):
+            return
+        if v_max <= v_min:
+            expand = max(1.0, abs(v_min) * 0.1)
+            v_min -= expand
+            v_max += expand
+        else:
+            span = v_max - v_min
+            padding = span * 0.1
+            v_min -= padding
+            v_max += padding
+
+        graph_surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        if background is not None:
+            graph_surface.fill(background)
+
+        if v_min <= 0.0 <= v_max:
+            zero_rel = (0.0 - v_min) / (v_max - v_min)
+            zero_y = rect.height - zero_rel * rect.height
+            pygame.draw.line(
+                graph_surface,
+                baseline_color,
+                (0, int(round(zero_y))),
+                (rect.width, int(round(zero_y))),
+                1,
+            )
+
+        def to_point(time_value: float, flux_value: float) -> tuple[int, int]:
+            x_rel = (time_value - t_min) / (t_max - t_min)
+            y_rel = (flux_value - v_min) / (v_max - v_min)
+            x = x_rel * rect.width
+            y = rect.height - y_rel * rect.height
+            return int(round(max(0.0, min(rect.width, x)))), int(round(max(0.0, min(rect.height, y))))
+
+        points: list[tuple[int, int]] = []
+        prev_time = times[0]
+        prev_val = values[0]
+        points.append(to_point(prev_time, prev_val))
+        for time_value, flux_value in zip(times[1:], values[1:]):
+            points.append(to_point(time_value, prev_val))
+            points.append(to_point(time_value, flux_value))
+            prev_time = time_value
+            prev_val = flux_value
+
+        if len(points) >= 2:
+            pygame.draw.lines(graph_surface, line_color, False, points, 2)
+
+        target_surface.blit(graph_surface, rect.topleft)
+
     # -----------------------------------------------------------------
     def add_tagged_particles(self, count: int) -> None:
         """
@@ -420,6 +600,7 @@ class Demo:
         """
         # Determine the starting index for new particles
         n_old = self.simulation._n_particles
+        self.reset_wall_hit_counters()
         # Build positions at the box centre with small random jitter
         jitter = 0.001  # small displacement to avoid stacking
         # Uniformly distribute jitter within a tiny square around centre
